@@ -9,7 +9,7 @@ import json
 import xgboost as xgb
 import shap
 import matplotlib.pyplot as plt
-
+import time 
 
 st.set_page_config(page_title="Football Prediction Dashboard", layout="centered")
 
@@ -370,7 +370,23 @@ if st.button("Predict Match"):
                 color="Outcome:N",
             )
 
-            st.altair_chart(chart, use_container_width=True)
+            # Animated probability bar chart
+            placeholder = st.empty()
+
+            steps = 30  # number of animation frames
+            for i in range(steps + 1):
+                df_anim = df_probs_chart.copy()
+                df_anim["Probability"] = df_anim["Probability"] * (i / steps)
+
+                chart_anim = alt.Chart(df_anim).mark_bar(size=50).encode(
+                    x=alt.X("Outcome:N", sort=["Home Win", "Draw", "Away Win"]),
+                    y=alt.Y("Probability:Q", scale=alt.Scale(domain=[0, 1])),
+                    color="Outcome:N",
+                )
+
+                placeholder.altair_chart(chart_anim, use_container_width=True)
+                time.sleep(0.03)
+
 
             # -------------------------------
             # CONFIDENCE INTERVALS (RF only)
