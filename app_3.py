@@ -7,6 +7,9 @@ import os
 import traceback
 import json
 import xgboost as xgb
+import shap
+import matplotlib.pyplot as plt
+
 
 st.set_page_config(page_title="Football Prediction Dashboard", layout="centered")
 
@@ -218,7 +221,114 @@ def predict_probabilities(team_home, team_away):
         "Probability": [p_final[2], p_final[1], p_final[0]],
     })
 
-    return df_probs, model_names
+    return df_probs, model_names, X_new
+
+def generate_natural_explanation(shap_values, feature_names):
+    # shap_values: shape (1, n_features)
+    shap_values = shap_values.flatten()
+
+    # Pair each feature with its SHAP impact
+    feature_impacts = list(zip(feature_names, shap_values))
+
+    # Sort by absolute impact (biggest influence first)
+    feature_impacts.sort(key=lambda x: abs(x[1]), reverse=True)
+
+    explanation_lines = []
+
+    for feature, impact in feature_impacts[:5]:  # top 5 features
+        direction = "increases" if impact > 0 else "decreases"
+        explanation_lines.append(f"- **{feature}** {direction} the chance of a Home Win.")
+
+    explanation = (
+        "### 🧠 Why the model predicted this\n"
+        "The model looks at many factors. Here are the most influential ones:\n\n"
+        + "\n".join(explanation_lines)
+        + "\n\nOverall, the model combines these effects to estimate the outcome of the Match."
+    )
+
+    return explanation
+
+def compute_confidence_intervals(probabilities_list):
+    """
+    probabilities_list: list of 3-element arrays [Home, Draw, Away]
+    """
+    probs = np.array(probabilities_list)  # shape (n_models, 3)
+
+    means = probs.mean(axis=0)
+    stds = probs.std(axis=0)
+
+    # 95% CI ≈ mean ± 2 * std
+    ci_low = means - 2 * stds
+    ci_high = means + 2 * stds
+
+    return means, ci_low, ci_high
+
+
+def show_shap_explanations(X_new, models):
+    st.subheader("🔍 SHAP Model Explanations")
+
+    # Random Forest SHAP
+    if models["Random Forest"]["model"] is not None:
+        try:
+            explainer_rf = shap.TreeExplainer(models["Random Forest"]["model"])
+            shap_values_rf = explainer_rf.shap_values(X_new[models["Random Forest"]["features"]])
+
+            #st.write("SHAP values RF:", np.array(shap_values_rf).shape)
+
+            # Correct indexing: sample=0, features=:, class=2 (Home Win)
+            shap_values_rf_home = shap_values_rf[0, :, 2].reshape(1, -1)
+
+            explanation_rf = generate_natural_explanation(
+                shap_values_rf_home,
+                models["Random Forest"]["features"]
+            )
+            st.markdown(explanation_rf)
+
+
+            st.write("Random Forest Feature Impact (Home Win)")
+            fig, ax = plt.subplots()
+            shap.summary_plot(
+                shap_values_rf_home,
+                X_new[models["Random Forest"]["features"]],
+                show=False
+            )
+            st.pyplot(fig)
+
+        except Exception:
+            st.warning("SHAP failed for Random Forest.")
+            st.code(traceback.format_exc())
+
+    # XGBoost SHAP
+    if models["XGBoost"]["model"] is not None:
+        try:
+            explainer_xgb = shap.TreeExplainer(models["XGBoost"]["model"])
+            shap_values_xgb = explainer_xgb.shap_values(X_new[models["XGBoost"]["features"]])
+
+            #st.write("XGB SHAP shape:", np.array(shap_values_xgb).shape)
+
+            # Correct indexing: sample=0, features=:, class=2 (Home Win)
+            shap_values_xgb_home = shap_values_xgb[0, :, 2].reshape(1, -1)
+
+            explanation_xgb = generate_natural_explanation(
+                shap_values_xgb_home,
+                models["XGBoost"]["features"]
+            )
+
+            st.markdown(explanation_xgb)
+
+            st.write("XGBoost Feature Impact (Home Win)")
+            fig, ax = plt.subplots()
+            shap.summary_plot(
+                shap_values_xgb_home,
+                X_new[models["XGBoost"]["features"]],
+                show=False
+            )
+            st.pyplot(fig)
+
+        except Exception:
+            st.warning("SHAP failed for XGBoost.")
+            st.code(traceback.format_exc())
+
 
 # -----------------------------
 # Streamlit UI
@@ -236,7 +346,7 @@ if st.button("Predict Match"):
         st.error("Please choose two different teams.")
     else:
         try:
-            df_probs, model_names = predict_probabilities(home_team, away_team)
+            df_probs, model_names, X_new = predict_probabilities(home_team, away_team)
 
             st.caption(f"Models used: {', '.join(model_names)}")
 
@@ -246,13 +356,59 @@ if st.button("Predict Match"):
             st.subheader("Predicted Probabilities")
             st.table(df_display.set_index("Outcome"))
 
-            chart = alt.Chart(df_probs).mark_bar(size=50).encode(
-                x=alt.X("Outcome:N"),
+            # Reorder outcomes for chart
+            df_probs_chart = df_probs.copy()
+            df_probs_chart["Outcome"] = pd.Categorical(
+                df_probs_chart["Outcome"],
+                categories=["Home Win", "Draw", "Away Win"],
+                ordered=True
+            )
+
+            chart = alt.Chart(df_probs_chart).mark_bar(size=50).encode(
+                x=alt.X("Outcome:N", sort=["Home Win", "Draw", "Away Win"]),
                 y=alt.Y("Probability:Q", scale=alt.Scale(domain=[0, 1])),
                 color="Outcome:N",
             )
 
             st.altair_chart(chart, use_container_width=True)
+
+            # -------------------------------
+            # CONFIDENCE INTERVALS (RF only)
+            # -------------------------------
+            all_model_probs = []
+
+            for model_name in model_names:
+                model = models[model_name]["model"]
+                features = models[model_name]["features"]
+
+                # Only sklearn models support predict_proba
+                if hasattr(model, "predict_proba"):
+                    p = model.predict_proba(X_new[features])[0]  # [Away, Draw, Home]
+                    all_model_probs.append(p)
+
+            # Only compute CI if we have at least 2 models
+            if len(all_model_probs) >= 2:
+                means, ci_low, ci_high = compute_confidence_intervals(all_model_probs)
+
+                st.subheader("📏 Confidence Intervals (Model Uncertainty)")
+
+                ci_df = pd.DataFrame({
+                    "Outcome": ["Away Win", "Draw", "Home Win"],
+                    "Mean Probability": means,
+                    "Lower CI": ci_low,
+                    "Upper CI": ci_high
+                })
+
+                ci_df["Mean Probability"] = (ci_df["Mean Probability"] * 100).round(2).astype(str) + " %"
+                ci_df["Lower CI"] = (ci_df["Lower CI"] * 100).round(2).astype(str) + " %"
+                ci_df["Upper CI"] = (ci_df["Upper CI"] * 100).round(2).astype(str) + " %"
+
+                st.table(ci_df)
+            else:
+                st.info("Confidence intervals require at least two models with predict_proba().")
+
+            # SHAP explanations
+            show_shap_explanations(X_new, models)
 
         except (ValueError, RuntimeError) as e:
             st.error(str(e))
